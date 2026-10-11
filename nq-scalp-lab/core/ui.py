@@ -183,17 +183,50 @@ def footer():
 
 
 # ------------------------------------------------------------------ sidebar
+def _now_paris() -> pd.Timestamp:
+    return pd.Timestamp.now(tz=PARIS_TZ)
+
+
+def refresh_all():
+    """Vide tous les caches (marché, partenaires, news, calendrier, ML) : la prochaine
+    exécution recharge tout et recalcule l'analyse, le biais et la décision."""
+    _market.clear()
+    _news.clear()
+    _ml.clear()
+    st.session_state["last_refresh"] = _now_paris()
+
+
+@st.fragment(run_every=60)
+def _auto_refresh_watch():
+    """Vérifie chaque minute si 15 min se sont écoulées depuis la dernière mise à jour."""
+    if not st.session_state.get("auto_refresh"):
+        return
+    last = st.session_state.get("last_refresh")
+    if last is None or (_now_paris() - last).total_seconds() >= 900:
+        refresh_all()
+        st.rerun(scope="app")
+
+
 def sidebar() -> dict:
     with st.sidebar:
+        st.session_state.setdefault("last_refresh", _now_paris())
+        if st.button("🔄 Mettre à jour toutes les données", type="primary", width="stretch",
+                     help="Recharge le marché (NQ + partenaires + poids lourds), les actualités "
+                          "géopolitiques / banques centrales, le calendrier et réentraîne les modèles. "
+                          "L'analyse, le biais et la décision sont recalculés."):
+            with st.spinner("Mise à jour de toutes les sources…"):
+                refresh_all()
+            st.rerun()
+        st.toggle("Mise à jour automatique (15 min)", value=False, key="auto_refresh",
+                  help="Relance la mise à jour complète toutes les 15 min tant que la page est ouverte.")
+        _auto_refresh_watch()
+        fresh_box = st.container()
         st.markdown("### ⚙️ Données")
         up = st.file_uploader("CSV NQ/MNQ 1 min (optionnel)", type=["csv"],
                               help="Export TradingView/NinjaTrader : time, open, high, low, close, volume. "
                                    "Remplace Yahoo pour NQ (plus frais).")
         csv_bytes = up.getvalue() if up else None
-        c1, c2 = st.columns(2)
-        if c1.button("🔄 Rafraîchir", width="stretch"):
-            st.cache_data.clear()
-        run_ml = c2.toggle("ML", value=True, help="Moteur de prévision walk-forward (≈30 s au 1er calcul)")
+        run_ml = st.toggle("Moteur ML (prévisions)", value=True, help="Moteur de prévision walk-forward (≈30 s au 1er calcul)")
         news_on = st.toggle("Actualités & calendrier", value=True)
         st.caption("Yahoo est différé d'environ 10-15 min sur NQ=F. Cache : 5 min (marché), 15 min (ML).")
         st.markdown("### 🏦 Compte Apex")
@@ -212,7 +245,7 @@ def sidebar() -> dict:
         bfrac = st.slider("Risque max (% du buffer DD)", 5, 30, step=1, key="bfrac") / 100
         losses = st.number_input("Pertes d'affilée", 0, 10, key="losses")
         st.caption("Règles Apex par défaut : à vérifier sur le site d'Apex, elles évoluent.")
-    return {"csv": csv_bytes, "ml": run_ml, "news": news_on, "acc": acc, "start": a["balance"],
+    return {"fresh_box": fresh_box, "csv": csv_bytes, "ml": run_ml, "news": news_on, "acc": acc, "start": a["balance"],
             "balance": bal, "peak": max(peak, bal), "dd": dd, "maxc": int(maxc), "risk": risk,
             "bfrac": bfrac, "losses": int(losses)}
 
@@ -224,24 +257,44 @@ def _market(csv_hash: str | None, csv_bytes: bytes | None):
     csv_df = load_csv(io.BytesIO(csv_bytes)) if csv_bytes else None
     mk = engine.load_market(csv_df)
     demo = mk["source"] == "demo"
-    return mk, engine.load_partners(demo), engine.load_heavy(demo)
+    return mk, engine.load_partners(demo), engine.load_heavy(demo), _now_paris()
 
 
 @st.cache_data(ttl=600, show_spinner="Lecture des actualités…")
 def _news():
-    return news.fetch_feeds(), news.fetch_calendar()
+    return news.fetch_feeds(), news.fetch_calendar(), _now_paris()
 
 
 @st.cache_data(ttl=900, show_spinner="Entraînement walk-forward des modèles (1 à 240 min)…")
 def _ml(csv_hash: str | None, _mk: dict, _partners: dict, last_ts):
-    return engine.run_forecasts(_mk, _partners)
+    return engine.run_forecasts(_mk, _partners), _now_paris()
 
 
 def bundle(opts: dict):
     h = hashlib.md5(opts["csv"]).hexdigest() if opts["csv"] else None
-    mk, partners, heavy = _market(h, opts["csv"])
-    nd, cal = _news() if opts["news"] else (pd.DataFrame(), pd.DataFrame())
-    ml = _ml(h, mk, partners, str(mk["5m"].index[-1])) if opts["ml"] else {}
+    mk, partners, heavy, t_mk = _market(h, opts["csv"])
+    nd, cal, t_news = _news() if opts["news"] else (pd.DataFrame(), pd.DataFrame(), None)
+    ml, t_ml = _ml(h, mk, partners, str(mk["5m"].index[-1])) if opts["ml"] else ({}, None)
     ctx, dec = engine.analyse(mk, partners, heavy, nd, cal, ml)
+    _freshness(opts.get("fresh_box", st.sidebar), t_mk, t_news, t_ml, ctx, nd)
     return {"mk": mk, "partners": partners, "heavy": heavy, "news": nd, "cal": cal, "ml": ml,
             "ctx": ctx, "dec": dec}
+
+
+def _freshness(box, t_mk, t_news, t_ml, ctx, nd):
+    """Encadré « fraîcheur des données » en haut de la barre latérale."""
+    def hm(t):
+        return t.strftime("%H:%M") if t is not None else "désactivé"
+
+    bar = ctx["last_ts"].tz_convert(PARIS_TZ).strftime("%d/%m %H:%M")
+    n_news = 0 if nd is None else len(nd)
+    age = (_now_paris() - t_mk).total_seconds() / 60 if t_mk is not None else 0
+    tone = "vert" if age < 15 else "orange" if age < 30 else "rouge"
+    box.markdown(
+        f'<div class="card" style="padding:10px 12px;margin-bottom:8px">'
+        f'<h4>Fraîcheur des données (Paris)</h4>'
+        f'{light(tone, f"Marché & partenaires : {hm(t_mk)}")}<br>'
+        f'{light("vert" if t_news is not None and n_news else "gris", f"News & calendrier : {hm(t_news)} ({n_news} articles)")}<br>'
+        f'{light("vert" if t_ml is not None else "gris", f"Modèles ML : {hm(t_ml)}")}<br>'
+        f'<span class="ks">Dernière barre NQ : {bar} · source {esc(ctx.get("source"))}</span></div>',
+        unsafe_allow_html=True)
